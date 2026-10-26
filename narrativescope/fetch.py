@@ -1,17 +1,21 @@
-"""Download prudente di pagine pubbliche.
+"""Download di pagine pubbliche con protezione da SSRF e DNS rebinding.
 
-Controlli applicati prima di ogni richiesta:
-- solo schemi http/https e porte 80/443;
-- l'host viene risolto e si rifiutano indirizzi privati, loopback, link-local,
-  riservati, multicast e non specificati;
-- redirect seguiti a mano (massimo 3), ricontrollando ogni destinazione;
-- dimensione massima del corpo, timeout, ritardo minimo tra richieste allo stesso host;
-- robots.txt rispettato quando leggibile.
+Il punto chiave è dove avviene il controllo degli indirizzi. Validare l'URL e poi
+lasciare che la libreria HTTP risolva di nuovo il nome apre una finestra fra controllo
+e uso: un DNS ostile può rispondere con un IP pubblico alla prima domanda e con
+127.0.0.1 alla seconda (DNS rebinding).
 
-Limite noto: la risoluzione DNS fatta per il controllo e quella fatta dalla libreria
-HTTP sono separate. Un server DNS ostile può rispondere in modo diverso fra le due
-(DNS rebinding). Per questo il programma va usato in locale da un singolo analista e
-non esposto come servizio che scarica URL forniti da terzi.
+Qui la risoluzione avviene una sola volta, dentro la connessione: il nome viene
+risolto, ogni indirizzo restituito viene validato e il socket si apre esattamente
+verso uno di quegli indirizzi. Il nome host originale resta usato per SNI, verifica
+del certificato TLS e intestazione Host, quindi HTTPS funziona normalmente.
+
+Altre regole:
+- solo http/https, porte 80/443, niente credenziali nell'URL;
+- rifiutati indirizzi privati, loopback, link-local, riservati, multicast, CGNAT;
+- redirect seguiti a mano (max 3), ognuno ricontrollato;
+- proxy da variabili d'ambiente ignorati (un proxy farebbe la risoluzione al posto nostro);
+- limite di dimensione, solo contenuti testuali, ritardo per host, robots.txt.
 """
 
 from __future__ import annotations
@@ -24,14 +28,19 @@ from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
-USER_AGENT = "NarrativeScope/0.1 (+ricerca OSINT locale; https://able2code.com)"
+from . import __version__
+
+USER_AGENT = f"NarrativeScope/{__version__} (+https://github.com/bithub-it/narrative-scope)"
 ALLOWED_PORTS = {80, 443}
 MAX_REDIRECTS = 3
 
 
 class FetchRefused(Exception):
-    """L'URL non supera i controlli di sicurezza."""
+    """L'URL o l'indirizzo di destinazione non supera i controlli di sicurezza."""
 
 
 @dataclass
@@ -43,27 +52,23 @@ class FetchResult:
     text: str
 
 
+# --- validazione indirizzi -------------------------------------------------
+
 def _check_ip(ip: str) -> None:
-    addr = ipaddress.ip_address(ip)
-    if (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-        or not addr.is_global
-    ):
+    addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    if getattr(addr, "ipv4_mapped", None):
+        addr = addr.ipv4_mapped
+    if not addr.is_global or addr.is_multicast or addr.is_reserved:
         raise FetchRefused(f"indirizzo non pubblico: {ip}")
 
 
-def resolve_public(host: str) -> list[str]:
-    """Risolve l'host e verifica che tutti gli indirizzi siano pubblici."""
+def resolve_public(host: str, port: int = 443) -> list[str]:
+    """Risolve l'host una volta e restituisce gli IP, solo se sono tutti pubblici."""
     try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise FetchRefused(f"DNS non risolto per {host}: {exc}") from exc
-    ips = sorted({info[4][0] for info in infos})
+    ips = list(dict.fromkeys(info[4][0] for info in infos))
     if not ips:
         raise FetchRefused(f"nessun indirizzo per {host}")
     for ip in ips:
@@ -72,6 +77,7 @@ def resolve_public(host: str) -> list[str]:
 
 
 def check_url(url: str) -> None:
+    """Controlli sintattici sull'URL; gli indirizzi si validano alla connessione."""
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
         raise FetchRefused(f"schema non ammesso: {parts.scheme or '(vuoto)'}")
@@ -79,11 +85,68 @@ def check_url(url: str) -> None:
         raise FetchRefused("URL senza host")
     if parts.username or parts.password:
         raise FetchRefused("credenziali nell'URL non ammesse")
-    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError as exc:
+        raise FetchRefused("porta non valida") from exc
     if port not in ALLOWED_PORTS:
         raise FetchRefused(f"porta non ammessa: {port}")
-    resolve_public(parts.hostname)
 
+
+# --- connessioni con IP verificato ----------------------------------------
+
+class _PinnedMixin:
+    """Risolve e valida il nome dentro la connessione, poi si collega a quell'IP."""
+
+    def _new_conn(self):  # type: ignore[override]
+        host = self._dns_host
+        ips = resolve_public(host, self.port)
+        last_exc: Exception | None = None
+        for ip in ips:
+            self._dns_host = ip
+            try:
+                return super()._new_conn()
+            except Exception as exc:  # prova l'indirizzo successivo
+                last_exc = exc
+            finally:
+                self._dns_host = host
+        assert last_exc is not None
+        raise last_exc
+
+
+class PinnedHTTPConnection(_PinnedMixin, HTTPConnection):
+    pass
+
+
+class PinnedHTTPSConnection(_PinnedMixin, HTTPSConnection):
+    pass
+
+
+class _PinnedHTTPPool(HTTPConnectionPool):
+    ConnectionCls = PinnedHTTPConnection
+
+
+class _PinnedHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = PinnedHTTPSConnection
+
+
+class PinnedAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {"http": _PinnedHTTPPool, "https": _PinnedHTTPSPool}
+
+
+def safe_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False  # nessun proxy da HTTP(S)_PROXY: la risoluzione resta nostra
+    adapter = PinnedAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers["User-Agent"] = USER_AGENT
+    return session
+
+
+# --- fetcher ----------------------------------------------------------------
 
 class PoliteFetcher:
     def __init__(
@@ -92,15 +155,12 @@ class PoliteFetcher:
         timeout: float = 15.0,
         max_bytes: int = 2_000_000,
         respect_robots: bool = True,
-        resolver_check: bool = True,
     ) -> None:
         self.delay = delay
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.respect_robots = respect_robots
-        self.resolver_check = resolver_check
-        self.session = requests.Session()
-        self.session.headers["User-Agent"] = USER_AGENT
+        self.session = safe_session()
         self._last_hit: dict[str, float] = {}
         self._robots: dict[str, urllib.robotparser.RobotFileParser | None] = {}
 
@@ -113,12 +173,9 @@ class PoliteFetcher:
         self._last_hit[host] = time.monotonic()
 
     def _raw_get(self, url: str) -> requests.Response:
-        if self.resolver_check:
-            check_url(url)
-        host = urlsplit(url).hostname or ""
-        self._wait(host)
-        resp = self.session.get(url, timeout=self.timeout, stream=True, allow_redirects=False)
-        return resp
+        check_url(url)
+        self._wait(urlsplit(url).hostname or "")
+        return self.session.get(url, timeout=self.timeout, stream=True, allow_redirects=False)
 
     def _read_limited(self, resp: requests.Response) -> bytes:
         declared = resp.headers.get("Content-Length")
@@ -144,30 +201,32 @@ class PoliteFetcher:
             try:
                 resp = self._raw_get(base + "/robots.txt")
                 if resp.status_code == 200:
-                    body = self._read_limited(resp).decode("utf-8", "replace")
-                    parser.parse(body.splitlines())
+                    parser.parse(self._read_limited(resp).decode("utf-8", "replace").splitlines())
                     self._robots[base] = parser
                 else:
                     resp.close()
-                    self._robots[base] = None  # nessun robots.txt leggibile: nessuna restrizione dichiarata
+                    self._robots[base] = None
             except (requests.RequestException, FetchRefused):
                 self._robots[base] = None
         parser = self._robots[base]
         return True if parser is None else parser.can_fetch(USER_AGENT, url)
 
-    def get(self, url: str) -> FetchResult:
-        if not self.allowed_by_robots(url):
+    def get(self, url: str, check_robots: bool = True) -> FetchResult:
+        if check_robots and not self.allowed_by_robots(url):
             raise FetchRefused("escluso da robots.txt")
         current = url
         for _ in range(MAX_REDIRECTS + 1):
             resp = self._raw_get(current)
-            if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+            if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("Location")
                 resp.close()
                 if not location:
                     raise FetchRefused("redirect senza destinazione")
                 current = urljoin(current, location)
                 continue
+            if resp.status_code >= 400:
+                resp.close()
+                raise FetchRefused(f"HTTP {resp.status_code}")
             ctype = resp.headers.get("Content-Type", "")
             if "html" not in ctype and "text" not in ctype:
                 resp.close()

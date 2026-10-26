@@ -63,15 +63,41 @@ def parse_artlist(payload: dict) -> list[Article]:
     return articles
 
 
-def search(query: str, max_results: int = 50, timespan: str = "7d", timeout: float = 30.0) -> list[Article]:
+def _gdelt_datetime(value: str, end: bool = False) -> str:
+    """Accetta AAAA-MM-GG o AAAA-MM-GGTHH:MM e restituisce il formato GDELT AAAAMMGGHHMMSS."""
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+        if fmt == "%Y-%m-%d" and end:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt.strftime("%Y%m%d%H%M%S")
+    raise ValueError(f"data non valida: {value} (usa AAAA-MM-GG)")
+
+
+def build_params(query: str, max_results: int = 50, timespan: str = "7d",
+                 since: str | None = None, until: str | None = None) -> dict:
     params = {
         "query": query,
         "mode": "ArtList",
         "format": "json",
         "maxrecords": max(1, min(int(max_results), 250)),
-        "timespan": timespan,
         "sort": "DateDesc",
     }
+    if since or until:
+        if since:
+            params["startdatetime"] = _gdelt_datetime(since)
+        if until:
+            params["enddatetime"] = _gdelt_datetime(until, end=True)
+    else:
+        params["timespan"] = timespan
+    return params
+
+
+def search(query: str, max_results: int = 50, timespan: str = "7d", since: str | None = None,
+           until: str | None = None, timeout: float = 30.0) -> list[Article]:
+    params = build_params(query, max_results, timespan, since, until)
     resp = requests.get(GDELT_DOC_API, params=params, timeout=timeout, headers={"User-Agent": USER_AGENT})
     resp.raise_for_status()
     try:
