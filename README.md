@@ -60,6 +60,12 @@ stessa narrazione tradotta. Il DNS è una fotografia del momento, non lo storico
 - **Limite noto:** il controllo DNS e la connessione usano due risoluzioni distinte, quindi non è una difesa completa contro il DNS rebinding. Usa lo strumento in locale; non esporlo come servizio che scarica URL forniti da altri.
 - Rispetta condizioni d'uso delle fonti, diritti sui contenuti e limiti di frequenza dell'API GDELT.
 
+## Approfondimenti
+
+- [Mappare le reti di disinformazione con Python: GDELT, DNS, grafi e limiti dell'attribuzione](https://able2code.com/sicurezza/narrativescope-osint-python-grafo-disinformazione/) – Able2Code: come funziona NarrativeScope, il caso Portal Kombat e la scala delle evidenze.
+- [Propaganda, SEO e motori di ricerca: come riconoscere le reti che amplificano le informazioni](https://bithub.it/blog/propaganda-seo-reti-siti-motori-ricerca/) – Bithub: come queste reti sfruttano la SEO e perché link e IP condivisi non bastano a provare un coordinamento.
+
+
 ## Test
 
 ```bash
